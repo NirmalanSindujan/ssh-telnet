@@ -41,30 +41,29 @@ function handleSession(ws) {
           // ✅ SSH connection
           if (type === "ssh") {
             ssh = new Client();
-            ssh
-              .on("ready", () => {
-                ws.send("[SSH] ✅ Connected\n");
-                ssh.shell((err, stream) => {
-                  if (err)
-                    return ws.send(`[SSH] ❌ Shell error: ${err.message}\n`);
+            ssh.on("ready", () => {
+              ws.send("[SSH] ✅ Connected\n");
+              ssh.shell({ term: "vt100" }, (err, stream) => {
+                if (err) {
+                  ws.send(`[SSH] ❌ Shell error: ${err.message}\n`);
+                  return;
+                }
 
-                  stream
-                    .on("data", (chunk) => ws.send(chunk.toString()))
-                    .on("close", () => ssh.end());
+                // Forward Cisco output to the browser
+                stream
+                  .on("data", (chunk) => ws.send(chunk.toString()))
+                  .on("close", () => ssh.end());
 
-                  // Forward frontend input
-                  ws.on("message", (input) => {
-                    const cmd = input.toString();
-                    if (!cmd.startsWith("{")) {
-                      stream.write(cmd);
-                    }
-                  });
+                // Only one message listener for commands
+                ws.on("message", (input) => {
+                  const cmd = input.toString();
+                  if (!cmd.startsWith("{")) {
+                    // Cisco wants carriage return
+                    stream.write(cmd.replace(/\n$/, "") + "\r");
+                  }
                 });
-              })
-              .on("error", (err) => {
-                ws.send(`[SSH] ❌ Connection error: ${err.message}\n`);
-              })
-              .connect({ host, port, username, password });
+              });
+            });
           }
 
           // ✅ Telnet connection (raw with negotiation)
