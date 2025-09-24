@@ -178,6 +178,3 @@ Ensuring that downloaded configuration files are **clean plain text**.
 
 ---
 
-## 📜 License
-
-MIT License © Paraqum Technologies  
