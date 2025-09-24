@@ -6,7 +6,12 @@ const { Client: SSHClient } = require("ssh2");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: "http://localhost:3000", // your React app URL
+    credentials: true,
+  })
+);
 app.use(bodyParser.json());
 
 const sessions = {}; // store telnet + ssh connections
@@ -16,6 +21,8 @@ const sessions = {}; // store telnet + ssh connections
  */
 app.post("/ssh/connect", (req, res) => {
   const { host, port = 22, username, password } = req.body;
+
+  let responded = false;
 
   if (!host || !username || !password) {
     return res.status(400).json({
@@ -27,21 +34,19 @@ app.post("/ssh/connect", (req, res) => {
   const ssh = new SSHClient();
   const sessionId = uuidv4();
   ssh.on("ready", () => {
-    console.log("✅ SSH connection ready");
     ssh.shell((err, stream) => {
       if (err) {
-        console.error("❌ Shell error:", err.message);
-        ssh.end();
-        return res.status(500).json({ success: false, error: err.message });
+        if (!responded) {
+          responded = true;
+          return res.status(500).json({ success: false, error: err.message });
+        }
       }
 
-      console.log("✅ Shell opened for session:", sessionId);
       sessions[sessionId] = { type: "ssh", conn: ssh, stream, output: [] };
       let loginStage = 0; // 0 = not started, 1 = sent username, 2 = sent password
 
       stream.on("data", (data) => {
         const out = data.toString();
-        console.log("📥 Device output:", out);
         sessions[sessionId].output.push(out);
 
         // Normalize output (remove CR/LF for matching)
@@ -51,11 +56,9 @@ app.post("/ssh/connect", (req, res) => {
           loginStage === 0 &&
           (clean.endsWith("username:") || clean.endsWith("user name:"))
         ) {
-          console.log("⚡ Auto-sending username:", username);
           stream.write(username + "\n");
           loginStage = 1;
         } else if (loginStage === 1 && clean.endsWith("password:")) {
-          console.log("⚡ Auto-sending password");
           stream.write(password + "\n");
           loginStage = 2;
         }
@@ -69,19 +72,19 @@ app.post("/ssh/connect", (req, res) => {
   ssh.on(
     "keyboard-interactive",
     (name, instructions, lang, prompts, finish) => {
-      console.log("⚡ Keyboard-interactive auth requested:", prompts);
       finish([password]);
     }
   );
 
   ssh.on("error", (err) => {
-    console.error("❌ SSH error:", err.message);
 
-    // store fake session just to stream the error to FE
-    sessions[sessionId] = { type: "ssh", conn: ssh, stream: null, output: [] };
-    sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
-
-    res.json({ success: true, sessionId }); // FE will still subscribe to stream
+    // if we already sent a response → push error into SSE output
+    if (sessions[sessionId]) {
+      sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
+    } else if (!responded) {
+      responded = true;
+      res.status(200).json({ success: false, error: err.message });
+    }
   });
 
   // Connect with both password + keyboard fallback
@@ -108,7 +111,6 @@ app.post("/ssh/connect", (req, res) => {
       hmac: ["hmac-sha1", "hmac-md5"],
       serverHostKey: ["ssh-rsa", "ssh-dss"],
     },
-    // debug: (msg) => console.log("🐛 DEBUG:", msg),
   });
 });
 
@@ -116,7 +118,7 @@ app.post("/ssh/connect", (req, res) => {
  * TELNET CONNECT (raw, no username/password)
  */
 app.post("/telnet/connect", async (req, res) => {
-  const { host, port = 23,password } = req.body;
+  const { host, port = 23, password } = req.body;
   const connection = new Telnet();
   const sessionId = uuidv4();
 
@@ -137,7 +139,7 @@ app.post("/telnet/connect", async (req, res) => {
 
     res.json({ success: true, sessionId });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(200).json({ success: false, error: err.message });
   }
 });
 
@@ -207,6 +209,103 @@ app.post("/disconnect", (req, res) => {
 
   delete sessions[sessionId];
   res.json({ success: true });
+});
+
+app.post("/run", (req, res) => {
+  const { sessionId, command } = req.body;
+  const session = sessions[sessionId];
+  if (!session) {
+    return res.status(404).json({ success: false, error: "Invalid session" });
+  }
+
+  let outputBuffer = "";
+  let finished = false;
+  let timeout;
+
+  const cleanup = () => {
+    if (session.type === "ssh") {
+      session.stream.removeListener("data", handleData);
+    } else {
+      session.conn.removeListener("data", handleData);
+    }
+    clearTimeout(timeout);
+  };
+
+  const resetTimeout = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(onTimeout, 5000); // idle timeout
+  };
+
+  const onTimeout = () => {
+    if (!finished) {
+      finished = true;
+      cleanup();
+      res.json({ success: true, output: outputBuffer });
+    }
+  };
+
+  const handleData = (data) => {
+    let text = data.toString();
+
+    // Reset idle timeout on every chunk
+    resetTimeout();
+
+    // Handle paging
+    if (/--More--|More:|<--- More --->/i.test(text)) {
+      if (session.type === "ssh") {
+        session.stream.write(" ");
+      } else if (session.type === "telnet") {
+        session.conn.send(" ");
+      }
+      // Remove pager lines (Cisco/Huawei/Juniper/HP)
+      text = text.replace(
+        /^(.*(--More--|More:|<--- More --->|<space>|CTRL\+Z|<return>).*\r?\n?)/gim,
+        ""
+      );
+
+      // 2. Remove ANSI escape sequences
+      text = text.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
+    }
+
+    outputBuffer += text;
+
+    // Detect end prompt (#, >, $)
+    const cleanText = text.trim();
+
+    // Detect prompt (must end with >, #, or $)
+    const isPrompt = /\S+[>#\$]$/.test(cleanText);
+
+    // Detect pager hints we want to ignore
+    const isPagerHint = /<space>|CTRL\+Z|<return>/i.test(cleanText);
+
+    if (isPrompt && !isPagerHint) {
+      if (!finished) {
+        finished = true;
+        cleanup();
+
+        if (
+          /not found/i.test(outputBuffer) ||
+          /command not found/i.test(outputBuffer) ||
+          /invalid input/i.test(outputBuffer) ||
+          outputBuffer.trim().length < 20
+        ) {
+          return res.json({ success: false, output: outputBuffer });
+        }
+
+        return res.json({ success: true, output: outputBuffer });
+      }
+    }
+  };
+
+  if (session.type === "ssh") {
+    session.stream.on("data", handleData);
+    session.stream.write(command.trim() + "\r\n");
+  } else if (session.type === "telnet") {
+    session.conn.on("data", handleData);
+    session.conn.send(command.trim() + "\r\n");
+  }
+
+  resetTimeout(); // start timeout
 });
 
 const PORT = 4000;
