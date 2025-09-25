@@ -77,7 +77,6 @@ app.post("/ssh/connect", (req, res) => {
   );
 
   ssh.on("error", (err) => {
-
     // if we already sent a response → push error into SSE output
     if (sessions[sessionId]) {
       sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
@@ -307,6 +306,338 @@ app.post("/run", (req, res) => {
 
   resetTimeout(); // start timeout
 });
+
+/**
+ * DOWNLOAD FULL CONFIGURATION (Telnet with character-mode fix)
+ */
+app.post("/download-config", async (req, res) => {
+  const { host, port = 23, username, password, vendor } = req.body;
+  const connection = new Telnet();
+  let outputBuffer = "";
+  let stage = "login"; // login -> enable -> command -> done
+  let finished = false;
+
+  const configCommand = {
+    1: "show running-config", // Generic
+    2: "show running-config", // Cisco
+    3: "display current-configuration", // Huawei
+    4: "show configuration | display set", // Juniper
+    99: "show running-config", // Others
+  };
+  const command = configCommand[vendor] || configCommand[99];
+
+  console.log(
+    `[TELNET][${host}] Starting download-config (vendor=${vendor}, command=${command})`
+  );
+
+  try {
+    await connection.connect({
+      host,
+      port,
+      timeout: 10000,
+      negotiationMandatory: false,
+      ors: "\r",
+      irs: "\n",
+      execTimeout: 0, // prevent "response not received"
+      sendTimeout: 0,
+      shellPrompt: "", // stop auto-prompt detection
+    });
+
+    console.log(`[TELNET][${host}] Connected successfully`);
+
+    // Helper to log + send
+    const send = (data, delay = 0) => {
+      setTimeout(() => {
+        console.log(`[TELNET][${host}] >>> "${data.replace(/\r/g, "\\r")}"`);
+        connection.write(data);
+      }, delay);
+    };
+
+    const cleanup = () => {
+      console.log(`[TELNET][${host}] Closing connection`);
+      connection.end();
+    };
+
+    const finish = (success, output) => {
+      if (!finished) {
+        finished = true;
+        cleanup();
+        res.json({ success, output });
+      }
+    };
+
+    // Raw socket listener to filter Telnet negotiations (IAC sequences)
+    connection.socket.on("data", (chunk) => {
+      if (chunk[0] === 255) {
+        console.log(`[TELNET][${host}] Ignoring Telnet negotiation:`, chunk);
+        return;
+      }
+    });
+
+    connection.on("data", (data) => {
+      const text = data.toString();
+      console.log(
+        `[TELNET][${host}] <<< "${text
+          .replace(/\r/g, "\\r")
+          .replace(/\n/g, "\\n")}"`
+      );
+
+      // --- LOGIN HANDLING ---
+      if (/username[: ]*$/i.test(text.trim())) {
+        console.log(`[TELNET][${host}] Detected username prompt`);
+        send(username + "\r", 200); // delay before sending username
+        return;
+      }
+      if (/password[: ]*$/i.test(text.trim()) && stage === "login") {
+        console.log(`[TELNET][${host}] Detected login password prompt`);
+        send(password + "\r", 400); // delay before sending password
+        return;
+      }
+
+      // --- ENABLE HANDLING ---
+      if (stage === "enable" && /password[: ]*$/i.test(text.trim())) {
+        console.log(`[TELNET][${host}] Detected enable password prompt`);
+        send(password + "\r", 400);
+        stage = "command";
+        return;
+      }
+
+      // --- PAGER HANDLING ---
+      if (/--More--|More:|<--- More --->/i.test(text)) {
+        console.log(`[TELNET][${host}] Pager detected`);
+        send(" ");
+        return;
+      }
+
+      // --- CLEAN + APPEND ---
+      const cleanText = text.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
+      outputBuffer += cleanText;
+
+      // --- PROMPT DETECTION ---
+      const trimmed = cleanText.trim();
+      const isPrompt = /\S+[>#\$]$/.test(trimmed);
+
+      if (isPrompt) {
+        console.log(`[TELNET][${host}] Detected prompt, stage=${stage}`);
+
+        if (stage === "login" && vendor === 2) {
+          console.log(`[TELNET][${host}] Sending 'enable'`);
+          send("enable\r");
+          stage = "enable";
+        } else if (stage === "login" && vendor !== 2) {
+          console.log(`[TELNET][${host}] Sending command: ${command}`);
+          send(command + "\r");
+          stage = "done";
+        } else if (stage === "command") {
+          console.log(
+            `[TELNET][${host}] Sending command after enable: ${command}`
+          );
+          send(command + "\r");
+          stage = "done";
+        } else if (stage === "done") {
+          console.log(`[TELNET][${host}] Finished collecting config`);
+          finish(true, outputBuffer);
+        }
+      }
+    });
+  } catch (err) {
+    console.error(`[TELNET][${host}] ERROR: ${err.message}`);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+
+
+
+const configCommand = {
+  1: "show running-config",                  // Generic
+  2: "show running-config",                  // Cisco
+  3: "display current-configuration",        // Huawei
+  4: "show configuration | display set",     // Juniper
+  99: "show running-config",                 // Others
+};
+
+/**
+ * TELNET RUN COMMAND (vendor-aware, with cleanup + idle timeout)
+ */
+app.post("/telnet/run-command", async (req, res) => {
+  const { host, port = 23, username, password, vendor = 99 } = req.body || {};
+  if (!host || !username || !password) {
+    return res.status(400).json({
+      success: false,
+      message: "host, username, password, vendor required",
+    });
+  }
+
+  const command = configCommand[vendor] || configCommand[99];
+  const tn = new Telnet();
+  let stage = "login"; // login -> enable -> command -> done
+  let outputBuffer = "";
+  let finished = false;
+  let idleTimer;
+  const EOL = "\r";
+
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      console.log(`[TELNET][${host}] Idle timeout → finishing`);
+      finish(true, { output: outputBuffer });
+    }, 5000); // 5s of silence = assume command done
+  };
+
+  const finish = (success, extra = {}) => {
+    if (finished) return;
+    finished = true;
+    if (idleTimer) clearTimeout(idleTimer);
+    try { tn.end(); } catch {}
+    res.json({ success, ...extra });
+  };
+
+  const fail = (message) =>
+    finish(false, { message, output: outputBuffer });
+
+  const cleanupAnsi = (s) =>
+    s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "") // strip ANSI
+     .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ""); // strip non-printable
+
+  const writeLine = (line, delayMs = 0) => {
+    setTimeout(() => {
+      console.log(`[TELNET][${host}] >>> ${JSON.stringify(line + EOL)}`);
+      tn.write(line + EOL);
+    }, delayMs);
+  };
+
+  const isShellPrompt = (text) => {
+    const t = text.trim();
+    if (/(username|user name|login|password)\s*:/i.test(t)) return false;
+    return /\S+[>#\]$]/.test(t); // Cisco >/#, Huawei >/], Juniper >/#, Unix $/#
+  };
+
+  try {
+    await tn.connect({
+      host,
+      port,
+      timeout: 15000,
+      negotiationMandatory: false,
+      shellPrompt: "",
+      execTimeout: 0,
+      sendTimeout: 0,
+      ors: "\r",
+      irs: "\n",
+    });
+
+    console.log(`[TELNET][${host}] Connected (run-command)`);
+
+    tn.on("data", (buf) => {
+      let text = buf.toString("utf8");
+
+      // --- remove pager strings ---
+      text = text
+        .replace(/--More--/gi, "")
+        .replace(/More:/gi, "")
+        .replace(/<--- More --->/gi, "")
+        .replace(/<space>/gi, "")
+        .replace(/CTRL\+Z/gi, "")
+        .replace(/<return>/gi, "");
+
+      // --- cleanup ANSI + junk ---
+      text = cleanupAnsi(text);
+
+      // append to buffer
+      outputBuffer += text;
+
+      resetIdleTimer();
+
+      const trimmed = text.trim();
+
+      // --- LOGIN HANDLING ---
+      if (/(username|user name|login)\s*:/i.test(trimmed) && stage === "login") {
+        writeLine(username, 200);
+        return;
+      }
+      if (/password\s*:/i.test(trimmed) && stage === "login") {
+        writeLine(password, 400);
+        return;
+      }
+
+      // --- ENABLE PASSWORD HANDLING ---
+      if (/password\s*:/i.test(trimmed) && stage === "enable") {
+        writeLine(password, 400);
+        stage = "command";
+        return;
+      }
+
+      // --- PAGER HANDLING ---
+      if (/--More--|More:|<--- More --->/i.test(buf.toString("utf8"))) {
+        console.log(`[TELNET][${host}] Pager detected → sending space`);
+        tn.write(" ");
+        return;
+      }
+
+      // --- PROMPT HANDLING ---
+      if (isShellPrompt(text)) {
+        console.log(`[TELNET][${host}] Prompt detected, stage=${stage}`);
+
+        if (stage === "login") {
+          if (trimmed.endsWith("$")) {
+            // Unix/Linux
+            return finish(false, { message: "Unsupported device (Unix shell)" });
+          } else if (trimmed.endsWith("#")) {
+            // Cisco privileged
+            writeLine(command, 200);
+            stage = "done";
+          } else if (trimmed.endsWith(">")) {
+            if (vendor === 2) {
+              // Cisco → need enable
+              writeLine("enable", 200);
+              stage = "enable";
+            } else if (vendor === 3) {
+              // Huawei → run directly
+              writeLine(command, 200);
+              stage = "done";
+            } else {
+              // Others → run directly
+              writeLine(command, 200);
+              stage = "done";
+            }
+          } else if (trimmed.endsWith("]")) {
+            if (vendor === 3) {
+              // Huawei system/config view
+              writeLine(command, 200);
+              stage = "done";
+            }
+          } else {
+            return finish(false, { message: `Unsupported prompt: ${trimmed}` });
+          }
+        } else if (stage === "command") {
+          console.log(`[TELNET][${host}] Sending command after enable: ${command}`);
+          writeLine(command, 200);
+          stage = "done";
+        } else if (stage === "done") {
+          console.log(`[TELNET][${host}] Command complete → finishing`);
+          return finish(true, { output: outputBuffer });
+        }
+      }
+    });
+
+    tn.on("close", () => {
+      if (!finished) fail("Connection closed before completion");
+    });
+
+    tn.on("error", (err) => {
+      if (!finished) fail(`Socket error: ${err.message}`);
+    });
+
+    // hard timeout
+    setTimeout(() => {
+      if (!finished) fail("Global timeout (20s)");
+    }, 20000);
+  } catch (err) {
+    console.error(`[TELNET][${host}] Connect ERROR: ${err.message}`);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 
 const PORT = 4000;
 app.listen(PORT, () => console.log(`HTTP terminal bridge running on ${PORT}`));
