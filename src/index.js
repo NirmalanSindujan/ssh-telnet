@@ -446,22 +446,17 @@ app.post("/download-config", async (req, res) => {
   }
 });
 
-
-
-
 const configCommand = {
-  1: "show running-config",                  // Generic
-  2: "show running-config",                  // Cisco
-  3: "display current-configuration",        // Huawei
-  4: "show configuration | display set",     // Juniper
-  99: "show running-config",                 // Others
+  1: "show running-config", // Generic
+  2: "show running-config", // Cisco
+  3: "display current-configuration", // Huawei
+  4: "show configuration | display set", // Juniper
+  99: "show running-config", // Others
 };
 
-/**
- * TELNET RUN COMMAND (vendor-aware, with cleanup + idle timeout)
- */
+
 app.post("/telnet/run-command", async (req, res) => {
-  const { host, port = 23, username, password, vendor = 99 } = req.body || {};
+  const { host, port = 23, username, password, vendor = 99, timeout = 20000 } = req.body || {};
   if (!host || !username || !password) {
     return res.status(400).json({
       success: false,
@@ -475,30 +470,40 @@ app.post("/telnet/run-command", async (req, res) => {
   let outputBuffer = "";
   let finished = false;
   let idleTimer;
+  let capture = false;
   const EOL = "\r";
 
+  // --- Helpers ---
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       console.log(`[TELNET][${host}] Idle timeout → finishing`);
       finish(true, { output: outputBuffer });
-    }, 5000); // 5s of silence = assume command done
+    }, 5000);
   };
 
   const finish = (success, extra = {}) => {
     if (finished) return;
     finished = true;
     if (idleTimer) clearTimeout(idleTimer);
-    try { tn.end(); } catch {}
+    try {
+      tn.end();
+    } catch {}
     res.json({ success, ...extra });
   };
 
-  const fail = (message) =>
-    finish(false, { message, output: outputBuffer });
+  const fail = (message) => finish(false, { message, output: outputBuffer });
 
   const cleanupAnsi = (s) =>
-    s.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "") // strip ANSI
-     .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ""); // strip non-printable
+    s
+      .replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "") // ANSI
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, "") // non-printable
+      .replace(/\r\n/g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .trim();
+
+  const stripPager = (s) =>
+    s.replace(/^.*?(--More--|More:|<--- More --->|<space>|CTRL\+Z|<return>).*$/gim, "");
 
   const writeLine = (line, delayMs = 0) => {
     setTimeout(() => {
@@ -510,7 +515,7 @@ app.post("/telnet/run-command", async (req, res) => {
   const isShellPrompt = (text) => {
     const t = text.trim();
     if (/(username|user name|login|password)\s*:/i.test(t)) return false;
-    return /\S+[>#\]$]/.test(t); // Cisco >/#, Huawei >/], Juniper >/#, Unix $/#
+    return /[^\s]+([>#\]])$/.test(t); // Cisco >/#, Huawei ]/>, Juniper >/#, Unix $/# 
   };
 
   try {
@@ -531,26 +536,18 @@ app.post("/telnet/run-command", async (req, res) => {
     tn.on("data", (buf) => {
       let text = buf.toString("utf8");
 
-      // --- remove pager strings ---
-      text = text
-        .replace(/--More--/gi, "")
-        .replace(/More:/gi, "")
-        .replace(/<--- More --->/gi, "")
-        .replace(/<space>/gi, "")
-        .replace(/CTRL\+Z/gi, "")
-        .replace(/<return>/gi, "");
-
-      // --- cleanup ANSI + junk ---
+      // clean junk
+      text = stripPager(text);
       text = cleanupAnsi(text);
 
-      // append to buffer
-      outputBuffer += text;
+      // append only if capturing
+      if (capture) outputBuffer += text;
 
       resetIdleTimer();
 
       const trimmed = text.trim();
 
-      // --- LOGIN HANDLING ---
+      // --- LOGIN ---
       if (/(username|user name|login)\s*:/i.test(trimmed) && stage === "login") {
         writeLine(username, 200);
         return;
@@ -560,59 +557,69 @@ app.post("/telnet/run-command", async (req, res) => {
         return;
       }
 
-      // --- ENABLE PASSWORD HANDLING ---
+      // --- ENABLE PASSWORD ---
       if (/password\s*:/i.test(trimmed) && stage === "enable") {
         writeLine(password, 400);
         stage = "command";
         return;
       }
 
-      // --- PAGER HANDLING ---
+      // --- PAGER continue ---
       if (/--More--|More:|<--- More --->/i.test(buf.toString("utf8"))) {
         console.log(`[TELNET][${host}] Pager detected → sending space`);
         tn.write(" ");
         return;
       }
 
-      // --- PROMPT HANDLING ---
+      // --- PROMPT ---
       if (isShellPrompt(text)) {
         console.log(`[TELNET][${host}] Prompt detected, stage=${stage}`);
 
         if (stage === "login") {
           if (trimmed.endsWith("$")) {
-            // Unix/Linux
             return finish(false, { message: "Unsupported device (Unix shell)" });
           } else if (trimmed.endsWith("#")) {
-            // Cisco privileged
+            // Already privileged
             writeLine(command, 200);
             stage = "done";
+            capture = true;
           } else if (trimmed.endsWith(">")) {
             if (vendor === 2) {
-              // Cisco → need enable
+              // Cisco needs enable
               writeLine("enable", 200);
               stage = "enable";
             } else if (vendor === 3) {
-              // Huawei → run directly
+              // Huawei can run directly
               writeLine(command, 200);
               stage = "done";
+              capture = true;
             } else {
-              // Others → run directly
+              // Default → run directly
               writeLine(command, 200);
               stage = "done";
+              capture = true;
             }
           } else if (trimmed.endsWith("]")) {
             if (vendor === 3) {
-              // Huawei system/config view
               writeLine(command, 200);
               stage = "done";
+              capture = true;
             }
           } else {
             return finish(false, { message: `Unsupported prompt: ${trimmed}` });
+          }
+        } else if (stage === "enable") {
+          // If enable succeeded without password
+          if (trimmed.endsWith("#")) {
+            writeLine(command, 200);
+            stage = "done";
+            capture = true;
           }
         } else if (stage === "command") {
           console.log(`[TELNET][${host}] Sending command after enable: ${command}`);
           writeLine(command, 200);
           stage = "done";
+          capture = true;
         } else if (stage === "done") {
           console.log(`[TELNET][${host}] Command complete → finishing`);
           return finish(true, { output: outputBuffer });
@@ -628,10 +635,10 @@ app.post("/telnet/run-command", async (req, res) => {
       if (!finished) fail(`Socket error: ${err.message}`);
     });
 
-    // hard timeout
+    // global timeout
     setTimeout(() => {
-      if (!finished) fail("Global timeout (20s)");
-    }, 20000);
+      if (!finished) fail(`Global timeout (${timeout / 1000}s)`);
+    }, timeout);
   } catch (err) {
     console.error(`[TELNET][${host}] Connect ERROR: ${err.message}`);
     return res.status(500).json({ success: false, message: err.message });
