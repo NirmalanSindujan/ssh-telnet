@@ -19,7 +19,7 @@ const sessions = {}; // store telnet + ssh connections
 /**
  * SSH CONNECT (raw shell, no username/password here)
  */
-app.post("/ssh/connect", (req, res) => {
+app.post("/api/ssh/connect", (req, res) => {
   const { host, port = 22, username, password } = req.body;
 
   let responded = false;
@@ -63,7 +63,7 @@ app.post("/ssh/connect", (req, res) => {
           loginStage = 2;
         }
       });
-
+      responded = true;
       res.json({ success: true, sessionId });
     });
   });
@@ -79,6 +79,7 @@ app.post("/ssh/connect", (req, res) => {
   ssh.on("error", (err) => {
     // if we already sent a response → push error into SSE output
     if (sessions[sessionId]) {
+      console.log(err.message)
       sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
     } else if (!responded) {
       responded = true;
@@ -116,8 +117,8 @@ app.post("/ssh/connect", (req, res) => {
 /**
  * TELNET CONNECT (raw, no username/password)
  */
-app.post("/telnet/connect", async (req, res) => {
-  const { host, port = 23, password } = req.body;
+app.post("/api/telnet/connect", async (req, res) => {
+  const { host, port = 23, password,username } = req.body;
   const connection = new Telnet();
   const sessionId = uuidv4();
 
@@ -127,7 +128,9 @@ app.post("/telnet/connect", async (req, res) => {
       port,
       timeout: 10000,
       negotiationMandatory: false,
-      password: password,
+      username: username,
+      password: password, 
+       
     });
 
     sessions[sessionId] = { type: "telnet", conn: connection, output: [] };
@@ -145,7 +148,7 @@ app.post("/telnet/connect", async (req, res) => {
 /**
  * SEND RAW INPUT
  */
-app.post("/send", (req, res) => {
+app.post("/api/send", (req, res) => {
   const { sessionId, input } = req.body;
   const session = sessions[sessionId];
   if (!session) return res.status(404).json({ error: "Invalid session" });
@@ -162,7 +165,7 @@ app.post("/send", (req, res) => {
 /**
  * SSE STREAM
  */
-app.get("/stream/:sessionId", (req, res) => {
+app.get("/api/stream/:sessionId", (req, res) => {
   const { sessionId } = req.params;
   const session = sessions[sessionId];
   if (!session) return res.status(404).end();
@@ -195,7 +198,7 @@ app.get("/stream/:sessionId", (req, res) => {
 /**
  * DISCONNECT
  */
-app.post("/disconnect", (req, res) => {
+app.post("/api/disconnect", (req, res) => {
   const { sessionId } = req.body;
   const session = sessions[sessionId];
   if (!session) return res.status(404).json({ error: "Invalid session" });
@@ -210,7 +213,7 @@ app.post("/disconnect", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/run", (req, res) => {
+app.post("/api/run", (req, res) => {
   const { sessionId, command } = req.body;
   const session = sessions[sessionId];
   if (!session) {
@@ -310,7 +313,7 @@ app.post("/run", (req, res) => {
 /**
  * DOWNLOAD FULL CONFIGURATION (Telnet with character-mode fix)
  */
-app.post("/download-config", async (req, res) => {
+app.post("/api/download-config", async (req, res) => {
   const { host, port = 23, username, password, vendor } = req.body;
   const connection = new Telnet();
   let outputBuffer = "";
@@ -445,7 +448,7 @@ app.post("/download-config", async (req, res) => {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
-
+    
 const configCommand = {
   1: "show running-config", // Generic
   2: "show running-config", // Cisco
@@ -455,7 +458,7 @@ const configCommand = {
 };
 
 
-app.post("/telnet/run-command", async (req, res) => {
+app.post("/api/telnet/run-command", async (req, res) => {
   const { host, port = 23, username, password, vendor = 99, timeout = 20000 } = req.body || {};
   if (!host || !username || !password) {
     return res.status(400).json({
