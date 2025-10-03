@@ -4,7 +4,7 @@ const bodyParser = require("body-parser");
 const { Telnet } = require("telnet-client");
 const { Client: SSHClient } = require("ssh2");
 const { v4: uuidv4 } = require("uuid");
-
+const TelnetStream = require("telnet-stream");
 const app = express();
 app.use(
   cors({
@@ -117,33 +117,62 @@ app.post("/api/ssh/connect", (req, res) => {
 /**
  * TELNET CONNECT (raw, no username/password)
  */
-app.post("/api/telnet/connect", async (req, res) => {
-  const { host, port = 23, password,username } = req.body;
-  const connection = new Telnet();
+const net = require("net");
+
+const { TelnetSocket } = require("telnet-stream");
+
+app.post("/api/telnet/connect", (req, res) => {
+  const { host, port = 23, username, password } = req.body;
+  const socket = net.createConnection(port, host);
+
+  // Wrap with TelnetSocket
+  const telnet = new TelnetSocket(socket);
+
   const sessionId = uuidv4();
+  sessions[sessionId] = { type: "telnet", conn: socket, output: [] };
 
-  try {
-    await connection.connect({
-      host,
-      port,
-      timeout: 10000,
-      negotiationMandatory: false,
-      username: username,
-      password: password, 
-       
-    });
+  let loginStage = 0;
 
-    sessions[sessionId] = { type: "telnet", conn: connection, output: [] };
+  telnet.on("data", (data) => {
+    const text = data.toString("utf8");
+    console.log("TELNET:", text);
+    sessions[sessionId].output.push(text);
 
-    connection.on("data", (data) => {
-      sessions[sessionId].output.push(data.toString());
-    });
+    if (loginStage === 0 && /(username|user name|login)\s*:/i.test(text)) {
+      telnet.write(username + "\r\n");
+      loginStage = 1;
+    } else if (loginStage === 1 && /password\s*:/i.test(text)) {
+      telnet.write(password + "\r\n");
+      loginStage = 2;
+    } else if (loginStage === 2 && /[$#>\]]\s*$/m.test(text.trim())) {
+      console.log("✅ Logged in");
+      loginStage = 3;
+    }
+  });
 
+  // Negotiate: refuse all options
+  telnet.on("do", (option) => telnet.writeWont(option));
+  telnet.on("will", (option) => telnet.writeDont(option));
+
+  socket.on("connect", () => {
+    console.log(`[TELNET][${host}] Connected`);
     res.json({ success: true, sessionId });
-  } catch (err) {
-    res.status(200).json({ success: false, error: err.message });
-  }
+  });
+
+  socket.on("close", () => {
+    console.log(`[TELNET][${host}] Connection closed`);
+    delete sessions[sessionId];
+  });
+
+  socket.on("error", (err) => {
+    console.error(`[TELNET][${host}] ERROR: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+    sessions[sessionId].output.push(`❌ ERROR: ${err.message}\n`);
+  });
 });
+
 
 /**
  * SEND RAW INPUT
@@ -154,7 +183,7 @@ app.post("/api/send", (req, res) => {
   if (!session) return res.status(404).json({ error: "Invalid session" });
 
   if (session.type === "telnet") {
-    session.conn.send(input);
+     session.conn.write(input.trim() + "\r\n");
   } else if (session.type === "ssh") {
     session.stream.write(input.trim() + "\r\n");
   }
@@ -213,254 +242,14 @@ app.post("/api/disconnect", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/run", (req, res) => {
-  const { sessionId, command } = req.body;
-  const session = sessions[sessionId];
-  if (!session) {
-    return res.status(404).json({ success: false, error: "Invalid session" });
-  }
 
-  let outputBuffer = "";
-  let finished = false;
-  let timeout;
-
-  const cleanup = () => {
-    if (session.type === "ssh") {
-      session.stream.removeListener("data", handleData);
-    } else {
-      session.conn.removeListener("data", handleData);
-    }
-    clearTimeout(timeout);
-  };
-
-  const resetTimeout = () => {
-    clearTimeout(timeout);
-    timeout = setTimeout(onTimeout, 5000); // idle timeout
-  };
-
-  const onTimeout = () => {
-    if (!finished) {
-      finished = true;
-      cleanup();
-      res.json({ success: true, output: outputBuffer });
-    }
-  };
-
-  const handleData = (data) => {
-    let text = data.toString();
-
-    // Reset idle timeout on every chunk
-    resetTimeout();
-
-    // Handle paging
-    if (/--More--|More:|<--- More --->/i.test(text)) {
-      if (session.type === "ssh") {
-        session.stream.write(" ");
-      } else if (session.type === "telnet") {
-        session.conn.send(" ");
-      }
-      // Remove pager lines (Cisco/Huawei/Juniper/HP)
-      text = text.replace(
-        /^(.*(--More--|More:|<--- More --->|<space>|CTRL\+Z|<return>).*\r?\n?)/gim,
-        ""
-      );
-
-      // 2. Remove ANSI escape sequences
-      text = text.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
-    }
-
-    outputBuffer += text;
-
-    // Detect end prompt (#, >, $)
-    const cleanText = text.trim();
-
-    // Detect prompt (must end with >, #, or $)
-    const isPrompt = /\S+[>#\$]$/.test(cleanText);
-
-    // Detect pager hints we want to ignore
-    const isPagerHint = /<space>|CTRL\+Z|<return>/i.test(cleanText);
-
-    if (isPrompt && !isPagerHint) {
-      if (!finished) {
-        finished = true;
-        cleanup();
-
-        if (
-          /not found/i.test(outputBuffer) ||
-          /command not found/i.test(outputBuffer) ||
-          /invalid input/i.test(outputBuffer) ||
-          outputBuffer.trim().length < 20
-        ) {
-          return res.json({ success: false, output: outputBuffer });
-        }
-
-        return res.json({ success: true, output: outputBuffer });
-      }
-    }
-  };
-
-  if (session.type === "ssh") {
-    session.stream.on("data", handleData);
-    session.stream.write(command.trim() + "\r\n");
-  } else if (session.type === "telnet") {
-    session.conn.on("data", handleData);
-    session.conn.send(command.trim() + "\r\n");
-  }
-
-  resetTimeout(); // start timeout
-});
 
 /**
  * DOWNLOAD FULL CONFIGURATION (Telnet with character-mode fix)
  */
-app.post("/api/download-config", async (req, res) => {
-  const { host, port = 23, username, password, vendor } = req.body;
-  const connection = new Telnet();
-  let outputBuffer = "";
-  let stage = "login"; // login -> enable -> command -> done
-  let finished = false;
-
-  const configCommand = {
-    1: "show running-config", // Generic
-    2: "show running-config", // Cisco
-    3: "display current-configuration", // Huawei
-    4: "show configuration | display set", // Juniper
-    99: "show running-config", // Others
-  };
-  const command = configCommand[vendor] || configCommand[99];
-
-  console.log(
-    `[TELNET][${host}] Starting download-config (vendor=${vendor}, command=${command})`
-  );
-
-  try {
-    await connection.connect({
-      host,
-      port,
-      timeout: 10000,
-      negotiationMandatory: false,
-      ors: "\r",
-      irs: "\n",
-      execTimeout: 0, // prevent "response not received"
-      sendTimeout: 0,
-      shellPrompt: "", // stop auto-prompt detection
-    });
-
-    console.log(`[TELNET][${host}] Connected successfully`);
-
-    // Helper to log + send
-    const send = (data, delay = 0) => {
-      setTimeout(() => {
-        console.log(`[TELNET][${host}] >>> "${data.replace(/\r/g, "\\r")}"`);
-        connection.write(data);
-      }, delay);
-    };
-
-    const cleanup = () => {
-      console.log(`[TELNET][${host}] Closing connection`);
-      connection.end();
-    };
-
-    const finish = (success, output) => {
-      if (!finished) {
-        finished = true;
-        cleanup();
-        res.json({ success, output });
-      }
-    };
-
-    // Raw socket listener to filter Telnet negotiations (IAC sequences)
-    connection.socket.on("data", (chunk) => {
-      if (chunk[0] === 255) {
-        console.log(`[TELNET][${host}] Ignoring Telnet negotiation:`, chunk);
-        return;
-      }
-    });
-
-    connection.on("data", (data) => {
-      const text = data.toString();
-      console.log(
-        `[TELNET][${host}] <<< "${text
-          .replace(/\r/g, "\\r")
-          .replace(/\n/g, "\\n")}"`
-      );
-
-      // --- LOGIN HANDLING ---
-      if (/username[: ]*$/i.test(text.trim())) {
-        console.log(`[TELNET][${host}] Detected username prompt`);
-        send(username + "\r", 200); // delay before sending username
-        return;
-      }
-      if (/password[: ]*$/i.test(text.trim()) && stage === "login") {
-        console.log(`[TELNET][${host}] Detected login password prompt`);
-        send(password + "\r", 400); // delay before sending password
-        return;
-      }
-
-      // --- ENABLE HANDLING ---
-      if (stage === "enable" && /password[: ]*$/i.test(text.trim())) {
-        console.log(`[TELNET][${host}] Detected enable password prompt`);
-        send(password + "\r", 400);
-        stage = "command";
-        return;
-      }
-
-      // --- PAGER HANDLING ---
-      if (/--More--|More:|<--- More --->/i.test(text)) {
-        console.log(`[TELNET][${host}] Pager detected`);
-        send(" ");
-        return;
-      }
-
-      // --- CLEAN + APPEND ---
-      const cleanText = text.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, "");
-      outputBuffer += cleanText;
-
-      // --- PROMPT DETECTION ---
-      const trimmed = cleanText.trim();
-      const isPrompt = /\S+[>#\$]$/.test(trimmed);
-
-      if (isPrompt) {
-        console.log(`[TELNET][${host}] Detected prompt, stage=${stage}`);
-
-        if (stage === "login" && vendor === 2) {
-          console.log(`[TELNET][${host}] Sending 'enable'`);
-          send("enable\r");
-          stage = "enable";
-        } else if (stage === "login" && vendor !== 2) {
-          console.log(`[TELNET][${host}] Sending command: ${command}`);
-          send(command + "\r");
-          stage = "done";
-        } else if (stage === "command") {
-          console.log(
-            `[TELNET][${host}] Sending command after enable: ${command}`
-          );
-          send(command + "\r");
-          stage = "done";
-        } else if (stage === "done") {
-          console.log(`[TELNET][${host}] Finished collecting config`);
-          finish(true, outputBuffer);
-        }
-      }
-    });
-  } catch (err) {
-    console.error(`[TELNET][${host}] ERROR: ${err.message}`);
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-    
-const configCommand = {
-  1: "show running-config", // Generic
-  2: "show running-config", // Cisco
-  3: "display current-configuration", // Huawei
-  4: "show configuration | display set", // Juniper
-  99: "show running-config", // Others
-};
-
-
-app.post("/api/telnet/run-command", async (req, res) => {
-  const { host, port = 23, username, password, vendor = 99, timeout = 20000 } = req.body || {};
-  if (!host || !username || !password) {
+app.post("/api/run", async (req, res) => {
+ const { host, port = 23, username, password, vendor = 99, timeout = 20000,enablePassword } = req.body || {};
+  if (!host || !username || !password || !enablePassword) {
     return res.status(400).json({
       success: false,
       message: "host, username, password, vendor required",
@@ -552,6 +341,7 @@ app.post("/api/telnet/run-command", async (req, res) => {
 
       // --- LOGIN ---
       if (/(username|user name|login)\s*:/i.test(trimmed) && stage === "login") {
+        
         writeLine(username, 200);
         return;
       }
@@ -562,7 +352,7 @@ app.post("/api/telnet/run-command", async (req, res) => {
 
       // --- ENABLE PASSWORD ---
       if (/password\s*:/i.test(trimmed) && stage === "enable") {
-        writeLine(password, 400);
+        writeLine(enablePassword, 400);
         stage = "command";
         return;
       }
@@ -647,6 +437,16 @@ app.post("/api/telnet/run-command", async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+    
+const configCommand = {
+  1: "show running-config", // Generic
+  2: "show running-config", // Cisco
+  3: "display current-configuration", // Huawei
+  4: "show configuration | display set", // Juniper
+  99: "show running-config", // Others
+};
+
+
 
 
 const PORT = 4000;
