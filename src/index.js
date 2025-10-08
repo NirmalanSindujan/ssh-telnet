@@ -78,8 +78,9 @@ app.post("/api/ssh/connect", (req, res) => {
 
   ssh.on("error", (err) => {
     // if we already sent a response → push error into SSE output
+    console.log(err)
     if (sessions[sessionId]) {
-      console.log(err.message)
+      console.log(err.message);
       sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
     } else if (!responded) {
       responded = true;
@@ -95,22 +96,55 @@ app.post("/api/ssh/connect", (req, res) => {
     password,
     tryKeyboard: true,
     algorithms: {
-      kex: [
-        "diffie-hellman-group1-sha1",
-        "diffie-hellman-group14-sha1",
-        "diffie-hellman-group-exchange-sha1",
-        "diffie-hellman-group-exchange-sha256",
-      ],
-      cipher: [
-        "aes128-ctr",
-        "aes192-ctr",
-        "aes256-ctr",
-        "aes128-cbc",
-        "3des-cbc",
-      ],
-      hmac: ["hmac-sha1", "hmac-md5"],
-      serverHostKey: ["ssh-rsa", "ssh-dss"],
-    },
+    kex: [
+      // Modern
+      "curve25519-sha256",
+      "curve25519-sha256@libssh.org",
+      "ecdh-sha2-nistp256",
+      "ecdh-sha2-nistp384",
+      "ecdh-sha2-nistp521",
+      // Legacy
+      "diffie-hellman-group-exchange-sha256",
+      "diffie-hellman-group-exchange-sha1",
+      "diffie-hellman-group14-sha1",
+      "diffie-hellman-group1-sha1",
+    ],
+    cipher: [
+      // Modern
+      "aes128-ctr",
+      "aes192-ctr",
+      "aes256-ctr",
+      "aes128-gcm@openssh.com",
+      "aes256-gcm@openssh.com",
+      // Legacy
+      "aes128-cbc",
+      "aes192-cbc",
+      "aes256-cbc",
+      "3des-cbc",
+    ],
+    hmac: [
+      // Modern
+      "hmac-sha2-256",
+      "hmac-sha2-512",
+      // Common
+      "hmac-sha1",
+      // Legacy
+      "hmac-md5",
+      "hmac-md5-96",
+      "hmac-sha1-96",
+      "hmac-ripemd160",
+    ],
+    serverHostKey: [
+      // Modern
+      "ssh-ed25519",
+      "ecdsa-sha2-nistp256",
+      "ecdsa-sha2-nistp384",
+      "ecdsa-sha2-nistp521",
+      // Legacy
+      "ssh-rsa",
+      "ssh-dss",
+    ],
+  }
   });
 });
 
@@ -173,7 +207,6 @@ app.post("/api/telnet/connect", (req, res) => {
   });
 });
 
-
 /**
  * SEND RAW INPUT
  */
@@ -183,7 +216,7 @@ app.post("/api/send", (req, res) => {
   if (!session) return res.status(404).json({ error: "Invalid session" });
 
   if (session.type === "telnet") {
-     session.conn.write(input.trim() + "\r\n");
+    session.conn.write(input.trim() + "\r\n");
   } else if (session.type === "ssh") {
     session.stream.write(input.trim() + "\r\n");
   }
@@ -242,13 +275,19 @@ app.post("/api/disconnect", (req, res) => {
   res.json({ success: true });
 });
 
-
-
 /**
  * DOWNLOAD FULL CONFIGURATION (Telnet with character-mode fix)
  */
 app.post("/api/run", async (req, res) => {
- const { host, port = 23, username, password, vendor = 99, timeout = 20000,enablePassword } = req.body || {};
+  const {
+    host,
+    port = 23,
+    username,
+    password,
+    vendor = 99,
+    timeout = 20000,
+    enablePassword,
+  } = req.body || {};
   if (!host || !username || !password || !enablePassword) {
     return res.status(400).json({
       success: false,
@@ -295,7 +334,10 @@ app.post("/api/run", async (req, res) => {
       .trim();
 
   const stripPager = (s) =>
-    s.replace(/^.*?(--More--|More:|<--- More --->|<space>|CTRL\+Z|<return>).*$/gim, "");
+    s.replace(
+      /^.*?(--More--|More:|<--- More --->|<space>|CTRL\+Z|<return>).*$/gim,
+      ""
+    );
 
   const writeLine = (line, delayMs = 0) => {
     setTimeout(() => {
@@ -307,7 +349,7 @@ app.post("/api/run", async (req, res) => {
   const isShellPrompt = (text) => {
     const t = text.trim();
     if (/(username|user name|login|password)\s*:/i.test(t)) return false;
-    return /[^\s]+([>#\]])$/.test(t); // Cisco >/#, Huawei ]/>, Juniper >/#, Unix $/# 
+    return /[^\s]+([>#\]])$/.test(t); // Cisco >/#, Huawei ]/>, Juniper >/#, Unix $/#
   };
 
   try {
@@ -340,8 +382,10 @@ app.post("/api/run", async (req, res) => {
       const trimmed = text.trim();
 
       // --- LOGIN ---
-      if (/(username|user name|login)\s*:/i.test(trimmed) && stage === "login") {
-        
+      if (
+        /(username|user name|login)\s*:/i.test(trimmed) &&
+        stage === "login"
+      ) {
         writeLine(username, 200);
         return;
       }
@@ -370,7 +414,9 @@ app.post("/api/run", async (req, res) => {
 
         if (stage === "login") {
           if (trimmed.endsWith("$")) {
-            return finish(false, { message: "Unsupported device (Unix shell)" });
+            return finish(false, {
+              message: "Unsupported device (Unix shell)",
+            });
           } else if (trimmed.endsWith("#")) {
             // Already privileged
             writeLine(command, 200);
@@ -409,7 +455,9 @@ app.post("/api/run", async (req, res) => {
             capture = true;
           }
         } else if (stage === "command") {
-          console.log(`[TELNET][${host}] Sending command after enable: ${command}`);
+          console.log(
+            `[TELNET][${host}] Sending command after enable: ${command}`
+          );
           writeLine(command, 200);
           stage = "done";
           capture = true;
@@ -437,7 +485,7 @@ app.post("/api/run", async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
-    
+
 const configCommand = {
   1: "show running-config", // Generic
   2: "show running-config", // Cisco
@@ -445,9 +493,6 @@ const configCommand = {
   4: "show configuration | display set", // Juniper
   99: "show running-config", // Others
 };
-
-
-
 
 const PORT = 4000;
 app.listen(PORT, () => console.log(`HTTP terminal bridge running on ${PORT}`));
