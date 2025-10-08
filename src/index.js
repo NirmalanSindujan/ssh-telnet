@@ -78,7 +78,7 @@ app.post("/api/ssh/connect", (req, res) => {
 
   ssh.on("error", (err) => {
     // if we already sent a response → push error into SSE output
-    console.log(err)
+    console.log(err);
     if (sessions[sessionId]) {
       console.log(err.message);
       sessions[sessionId].output.push(`❌ SSH Error: ${err.message}\n`);
@@ -96,55 +96,55 @@ app.post("/api/ssh/connect", (req, res) => {
     password,
     tryKeyboard: true,
     algorithms: {
-    kex: [
-      // Modern
-      "curve25519-sha256",
-      "curve25519-sha256@libssh.org",
-      "ecdh-sha2-nistp256",
-      "ecdh-sha2-nistp384",
-      "ecdh-sha2-nistp521",
-      // Legacy
-      "diffie-hellman-group-exchange-sha256",
-      "diffie-hellman-group-exchange-sha1",
-      "diffie-hellman-group14-sha1",
-      "diffie-hellman-group1-sha1",
-    ],
-    cipher: [
-      // Modern
-      "aes128-ctr",
-      "aes192-ctr",
-      "aes256-ctr",
-      "aes128-gcm@openssh.com",
-      "aes256-gcm@openssh.com",
-      // Legacy
-      "aes128-cbc",
-      "aes192-cbc",
-      "aes256-cbc",
-      "3des-cbc",
-    ],
-    hmac: [
-      // Modern
-      "hmac-sha2-256",
-      "hmac-sha2-512",
-      // Common
-      "hmac-sha1",
-      // Legacy
-      "hmac-md5",
-      "hmac-md5-96",
-      "hmac-sha1-96",
-      "hmac-ripemd160",
-    ],
-    serverHostKey: [
-      // Modern
-      "ssh-ed25519",
-      "ecdsa-sha2-nistp256",
-      "ecdsa-sha2-nistp384",
-      "ecdsa-sha2-nistp521",
-      // Legacy
-      "ssh-rsa",
-      "ssh-dss",
-    ],
-  }
+      kex: [
+        // Modern
+        "curve25519-sha256",
+        "curve25519-sha256@libssh.org",
+        "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384",
+        "ecdh-sha2-nistp521",
+        // Legacy
+        "diffie-hellman-group-exchange-sha256",
+        "diffie-hellman-group-exchange-sha1",
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group1-sha1",
+      ],
+      cipher: [
+        // Modern
+        "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
+        "aes128-gcm@openssh.com",
+        "aes256-gcm@openssh.com",
+        // Legacy
+        "aes128-cbc",
+        "aes192-cbc",
+        "aes256-cbc",
+        "3des-cbc",
+      ],
+      hmac: [
+        // Modern
+        "hmac-sha2-256",
+        "hmac-sha2-512",
+        // Common
+        "hmac-sha1",
+        // Legacy
+        "hmac-md5",
+        "hmac-md5-96",
+        "hmac-sha1-96",
+        "hmac-ripemd160",
+      ],
+      serverHostKey: [
+        // Modern
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        // Legacy
+        "ssh-rsa",
+        "ssh-dss",
+      ],
+    },
   });
 });
 
@@ -288,11 +288,21 @@ app.post("/api/run", async (req, res) => {
     timeout = 20000,
     enablePassword,
   } = req.body || {};
-  if (!host || !username || !password || !enablePassword) {
+
+  if (!host || !username || !password) {
     return res.status(400).json({
       success: false,
       message: "host, username, password, vendor required",
     });
+  }
+
+  if (vendor === 2) {
+    if (!enablePassword) {
+      return res.status(400).json({
+        success: false,
+        message: "enablePassword required",
+      });
+    }
   }
 
   const command = configCommand[vendor] || configCommand[99];
